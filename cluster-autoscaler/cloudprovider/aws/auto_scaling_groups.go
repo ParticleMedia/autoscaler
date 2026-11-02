@@ -552,6 +552,15 @@ func (m *asgCache) isNodeGroupAvailable(group *autoscalingtypes.AutoScalingGroup
 			if activity.StartTime.Before(lut) {
 				break
 			} else if activity.StatusCode == autoscalingtypes.ScalingActivityStatusCodeFailed {
+				if isSubnetScopedFailure(activity) && hasMultipleSubnets(group) {
+					// The failure is scoped to a single subnet. With a multi-subnet ASG,
+					// AWS retries the launch in another subnet/AZ on its own, so do not
+					// treat the whole node group as unavailable. If every subnet is
+					// exhausted, the scale-up still fails via max-node-provision-time.
+					klog.Warningf("ASG %s scaling failed in one subnet, ignoring since the ASG spans multiple subnets: %s",
+						asgRef.Name, aws.ToString(activity.StatusMessage))
+					continue
+				}
 				klog.Warningf("ASG %s scaling failed with description: %s", asgRef.Name, aws.ToString(activity.Description))
 				return false, nil
 			}
@@ -560,6 +569,35 @@ func (m *asgCache) isNodeGroupAvailable(group *autoscalingtypes.AutoScalingGroup
 		}
 	}
 	return true, nil
+}
+
+// subnetScopedFailureCodes are EC2 launch errors that only affect one subnet,
+// not the capacity of the ASG as a whole.
+var subnetScopedFailureCodes = []string{
+	"InsufficientFreeAddressesInSubnet",
+}
+
+// isSubnetScopedFailure reports whether a failed scaling activity was caused
+// by a subnet-scoped error such as running out of free IP addresses.
+func isSubnetScopedFailure(activity autoscalingtypes.Activity) bool {
+	msg := aws.ToString(activity.StatusMessage) + " " + aws.ToString(activity.Description)
+	for _, code := range subnetScopedFailureCodes {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMultipleSubnets reports whether the ASG is configured with more than one subnet.
+func hasMultipleSubnets(group *autoscalingtypes.AutoScalingGroup) bool {
+	count := 0
+	for _, subnet := range strings.Split(aws.ToString(group.VPCZoneIdentifier), ",") {
+		if strings.TrimSpace(subnet) != "" {
+			count++
+		}
+	}
+	return count > 1
 }
 
 func (m *asgCache) buildAsgFromAWS(g *autoscalingtypes.AutoScalingGroup) (*asg, error) {
