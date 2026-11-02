@@ -62,6 +62,9 @@ func TestCreatePlaceholders(t *testing.T) {
 		groupLastUpdateTime time.Time
 		describeErr         error
 		asgToCheck          *string
+		vpcZoneIdentifier   *string
+		// failureIgnored marks cases where a failed activity must not make the ASG unavailable.
+		failureIgnored bool
 	}{
 		{
 			name:            "add placeholders successful",
@@ -110,6 +113,64 @@ func TestCreatePlaceholders(t *testing.T) {
 			groupLastUpdateTime: time.Unix(9, 0),
 			asgToCheck:          aws.String("unregisteredAsgName"),
 		},
+		{
+			name:            "subnet IP exhaustion ignored when ASG spans multiple subnets",
+			desiredCapacity: aws.Int64(1),
+			activities: []*autoscaling.Activity{
+				{
+					StatusCode:    aws.String("Failed"),
+					StatusMessage: aws.String("Could not launch On-Demand Instances. InsufficientFreeAddressesInSubnet - There are not enough free addresses in subnet 'subnet-b' to satisfy the requested number of instances. Launching EC2 instance failed."),
+					StartTime:     aws.Time(time.Unix(10, 0)),
+				},
+			},
+			groupLastUpdateTime: time.Unix(9, 0),
+			vpcZoneIdentifier:   aws.String("subnet-a,subnet-b,subnet-c"),
+			failureIgnored:      true,
+		},
+		{
+			name:            "subnet IP exhaustion not ignored when ASG has a single subnet",
+			desiredCapacity: aws.Int64(1),
+			activities: []*autoscaling.Activity{
+				{
+					StatusCode:    aws.String("Failed"),
+					StatusMessage: aws.String("Could not launch On-Demand Instances. InsufficientFreeAddressesInSubnet - There are not enough free addresses in subnet 'subnet-a'."),
+					StartTime:     aws.Time(time.Unix(10, 0)),
+				},
+			},
+			groupLastUpdateTime: time.Unix(9, 0),
+			vpcZoneIdentifier:   aws.String("subnet-a"),
+		},
+		{
+			name:            "non subnet-scoped failure not ignored with multiple subnets",
+			desiredCapacity: aws.Int64(1),
+			activities: []*autoscaling.Activity{
+				{
+					StatusCode:    aws.String("Failed"),
+					StatusMessage: aws.String("Could not launch On-Demand Instances. InsufficientInstanceCapacity - We currently do not have sufficient capacity."),
+					StartTime:     aws.Time(time.Unix(10, 0)),
+				},
+			},
+			groupLastUpdateTime: time.Unix(9, 0),
+			vpcZoneIdentifier:   aws.String("subnet-a,subnet-b"),
+		},
+		{
+			name:            "other failure after subnet IP exhaustion still detected",
+			desiredCapacity: aws.Int64(1),
+			activities: []*autoscaling.Activity{
+				{
+					StatusCode:    aws.String("Failed"),
+					StatusMessage: aws.String("InsufficientFreeAddressesInSubnet - There are not enough free addresses in subnet 'subnet-b'."),
+					StartTime:     aws.Time(time.Unix(11, 0)),
+				},
+				{
+					StatusCode:    aws.String("Failed"),
+					StatusMessage: aws.String("InsufficientInstanceCapacity - We currently do not have sufficient capacity."),
+					StartTime:     aws.Time(time.Unix(10, 0)),
+				},
+			},
+			groupLastUpdateTime: time.Unix(9, 0),
+			vpcZoneIdentifier:   aws.String("subnet-a,subnet-b"),
+		},
 	}
 
 	for _, tc := range cases {
@@ -153,11 +214,12 @@ func TestCreatePlaceholders(t *testing.T) {
 					AvailabilityZones:    []*string{aws.String("westeros-1a")},
 					DesiredCapacity:      tc.desiredCapacity,
 					Instances:            []*autoscaling.Instance{},
+					VPCZoneIdentifier:    tc.vpcZoneIdentifier,
 				},
 			}
 			asgCache.createPlaceholdersForDesiredNonStartedInstances(groups)
 			assert.Equal(t, int64(len(groups[0].Instances)), *tc.desiredCapacity)
-			if tc.activities != nil && *tc.activities[0].StatusCode == "Failed" && tc.activities[0].StartTime.After(tc.groupLastUpdateTime) && asgName == registeredAsgName {
+			if tc.activities != nil && *tc.activities[0].StatusCode == "Failed" && tc.activities[0].StartTime.After(tc.groupLastUpdateTime) && asgName == registeredAsgName && !tc.failureIgnored {
 				assert.Equal(t, *groups[0].Instances[0].HealthStatus, placeholderUnfulfillableStatus)
 			} else if len(groups[0].Instances) > 0 {
 				assert.Equal(t, *groups[0].Instances[0].HealthStatus, "")
